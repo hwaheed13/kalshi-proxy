@@ -1,111 +1,75 @@
-// /api/kalshi.js  (Vercel Serverless Function)
-
+// /api/kalshi
 export default async function handler(req, res) {
-  // --- CORS ---
-  res.setHeader("Access-Control-Allow-Origin", "*"); // or lock to your domain
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const base = "https://api.elections.kalshi.com/trade-api/v2";
-  const { path, date, ...rest } = req.query || {};
+  const { date } = req.query || {};
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: "Missing or bad ?date=YYYY-MM-DD" });
+  }
 
   try {
-    // -------------------------
-    // MODE A: Simple pass-through proxy using ?path=/... (optional)
-    // Example:
-    //   /api/kalshi?path=/markets&series_ticker=KXHIGHNY&status=settled
-    // -------------------------
-    if (path) {
-      const qs = new URLSearchParams(rest).toString();
-      const url = `${base}${path}${qs ? `?${qs}` : ""}`;
-      const r = await fetch(url, { headers: { Accept: "application/json" } });
+    // Try HIGHNY first, then fallback to KXHIGHNY for older days (or vice versa if needed)
+    const info = await getEventSettlementInfo(date, "HIGHNY") 
+               || await getEventSettlementInfo(date, "KXHIGHNY");
 
-      // cache a little at the edge
-      res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=60");
+    // cache a bit at the edge
+    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=60");
 
-      const text = await r.text();
-      // pass through Kalshi status and body
-      // (Kalshi returns JSON; we forward it as JSON if possible)
-      try {
-        return res.status(r.status).json(JSON.parse(text));
-      } catch {
-        return res.status(r.status).send(text);
-      }
-    }
-
-    // -------------------------
-    // MODE B: Smart helper using ?date=YYYY-MM-DD
-    // It figures out the winning range via up to 3 Kalshi calls server-side.
-    // Example:
-    //   /api/kalshi?date=2025-07-05
-    // -------------------------
-    if (date) {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-        return res.status(400).json({ error: "Bad ?date=YYYY-MM-DD" });
-      }
-
-      const eventTicker = toKalshiEventTicker(date);
-
-      // 1) Event with nested markets
-      let info = null;
-      const r0 = await fetch(
-        `${base}/events/${encodeURIComponent(eventTicker)}?with_nested_markets=true`,
-        { headers: { Accept: "application/json" } }
-      );
-      if (r0.ok) {
-        const j0 = await r0.json();
-        info = winnerToInfo(pickWinner(j0?.event?.markets));
-      }
-
-      // 2) Markets by event
-      if (!info) {
-        const r1 = await fetch(
-          `${base}/markets?event_ticker=${encodeURIComponent(eventTicker)}`,
-          { headers: { Accept: "application/json" } }
-        );
-        if (r1.ok) {
-          const j1 = await r1.json();
-          info = winnerToInfo(pickWinner(j1?.markets));
-        }
-      }
-
-      // 3) Series fallback (filter to this event)
-      if (!info) {
-        const r2 = await fetch(
-          `${base}/markets?series_ticker=KXHIGHNY&status=settled`,
-          { headers: { Accept: "application/json" } }
-        );
-        if (r2.ok) {
-          const j2 = await r2.json();
-          const mkts = (j2?.markets || []).filter(m => m.event_ticker === eventTicker);
-          info = winnerToInfo(pickWinner(mkts));
-        }
-      }
-
-      res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=60");
-
-      if (!info) return res.status(204).end(); // no content yet
-      return res.status(200).json({
-        ...info,
-        eventTicker,
-        url: "https://kalshi.com/markets/kxhighny",
-      });
-    }
-
-    // If neither path nor date is provided
-    return res.status(400).json({ error: "Provide ?path=/... or ?date=YYYY-MM-DD" });
+    if (!info) return res.status(204).end(); // no content yet
+    return res.status(200).json(info);
   } catch (err) {
     console.error(err);
     return res.status(502).json({ error: "Upstream error", details: String(err) });
   }
 }
 
-function toKalshiEventTicker(dateISO) {
+async function getEventSettlementInfo(dateISO, prefix) {
+  const base = "https://api.elections.kalshi.com/trade-api/v2";
+  const eventTicker = toKalshiEventTicker(dateISO, prefix);
+
+  // Always try the event endpoint first; it often includes settlement at the event level
+  const r = await fetch(`${base}/events/${encodeURIComponent(eventTicker)}?with_nested_markets=true`, {
+    headers: { Accept: "application/json" },
+  });
+
+  if (!r.ok) return null;
+  const j = await r.json();
+  const ev = j?.event;
+  if (!ev) return null;
+
+  // If event has settlement_value, use it directly
+  if (ev.status && ev.status.toLowerCase() === "settled" && ev.settlement_value != null) {
+    return {
+      label: (ev.settlement_value_dollars || `${ev.settlement_value} °F`).toString(),
+      exactTemp: Number(ev.settlement_value),
+      eventTicker,
+      url: "https://kalshi.com/markets/kxhighny",
+    };
+  }
+
+  // Otherwise, look for a settled/yes market as a fallback
+  const winner = pickWinner(ev.markets);
+  if (winner) {
+    return {
+      label: winner.subtitle || winner.title || winner.ticker || "Settled",
+      exactTemp: toNumberOrNull(winner.expiration_value ?? winner.settlement_value),
+      eventTicker,
+      url: "https://kalshi.com/markets/kxhighny",
+    };
+  }
+
+  return null;
+}
+
+function toKalshiEventTicker(dateISO, prefix) {
   const [Y, M, D] = dateISO.split("-");
   const yy = Y.slice(-2);
   const mon = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][Number(M)-1];
-  return `KXHIGHNY-${yy}${mon}${D}`;
+  return `${prefix}-${yy}${mon}${D}`;
 }
 
 function pickWinner(markets) {
@@ -117,12 +81,7 @@ function pickWinner(markets) {
   ) || null;
 }
 
-function winnerToInfo(w) {
-  if (!w) return null;
-  const label = w.subtitle || w.title || w.ticker || "Settled";
-  const exactTemp =
-    w.expiration_value != null ? Number(w.expiration_value) :
-    w.settlement_value != null ? Number(w.settlement_value) :
-    null;
-  return { label, exactTemp };
+function toNumberOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
