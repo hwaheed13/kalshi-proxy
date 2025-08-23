@@ -1,102 +1,98 @@
-// /api/kalshi.js
+// api/kalshi.js
 export default async function handler(req, res) {
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*"); // or your domain
+  // --- CORS: always set, and vary by origin
+  const origin = req.headers.origin || "*";          // or restrict to https://waheedweather.dewdropventures.com
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
+
+  // --- IMPORTANT: kill caching to avoid 304 without CORS headers
+  res.setHeader("Cache-Control", "no-store");
+
+  // Preflight
+  if (req.method === "OPTIONS") return res.status(204).end();
 
   const { date } = req.query || {};
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return res.status(400).json({ error: "Missing or bad ?date=YYYY-MM-DD" });
   }
 
-  // Try BOTH possible event tickers (some data shows "HIGHNY", we also used "KXHIGHNY")
-  const tickers = toKalshiTickers(date);
   const base = "https://api.elections.kalshi.com/trade-api/v2";
+  const eventTicker = toKalshiEventTicker(date);
 
   try {
-    let info = null, usedTicker = null;
+    let info = null;
 
-    for (const eventTicker of tickers) {
-      // 1) events?with_nested_markets=true
-      let r = await fetch(`${base}/events/${encodeURIComponent(eventTicker)}?with_nested_markets=true`,
-        { headers: { Accept: "application/json" } });
-      if (r.ok) {
-        const j = await r.json();
-        info = winnerToInfo(pickWinner(j?.event?.markets)) || valueFromEvent(j?.event);
-        if (info) { usedTicker = eventTicker; break; }
-      }
+    // 1) Event with nested markets
+    const r0 = await fetch(
+      `${base}/events/${encodeURIComponent(eventTicker)}?with_nested_markets=true`,
+      { headers: { Accept: "application/json" } }
+    );
+    if (r0.ok) {
+      const j0 = await r0.json();
+      info = winnerToInfo(pickWinner(j0?.event?.markets));
+    }
 
-      // 2) markets?event_ticker=
-      r = await fetch(`${base}/markets?event_ticker=${encodeURIComponent(eventTicker)}`,
-        { headers: { Accept: "application/json" } });
-      if (r.ok) {
-        const j = await r.json();
-        info = winnerToInfo(pickWinner(j?.markets));
-        if (info) { usedTicker = eventTicker; break; }
-      }
-
-      // 3) series fallback (settled only)
-      r = await fetch(`${base}/markets?series_ticker=KXHIGHNY&status=settled`,
-        { headers: { Accept: "application/json" } });
-      if (r.ok) {
-        const j = await r.json();
-        const mkts = (j?.markets || []).filter(m => m.event_ticker === eventTicker);
-        info = winnerToInfo(pickWinner(mkts));
-        if (info) { usedTicker = eventTicker; break; }
+    // 2) Markets by event
+    if (!info) {
+      const r1 = await fetch(
+        `${base}/markets?event_ticker=${encodeURIComponent(eventTicker)}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (r1.ok) {
+        const j1 = await r1.json();
+        info = winnerToInfo(pickWinner(j1?.markets));
       }
     }
 
-    // edge cache
-    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=60");
+    // 3) Series fallback (filter to this event)
+    if (!info) {
+      const r2 = await fetch(
+        `${base}/markets?series_ticker=KXHIGHNY&status=settled`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (r2.ok) {
+        const j2 = await r2.json();
+        const mkts = (j2?.markets || []).filter(m => m.event_ticker === eventTicker);
+        info = winnerToInfo(pickWinner(mkts));
+      }
+    }
 
-    if (!info) return res.status(204).end();
+    if (!info) return res.status(204).end(); // no content yet
     return res.status(200).json({
       ...info,
-      eventTicker: usedTicker,
-      url: "https://kalshi.com/markets/kxhighny"
+      eventTicker,
+      url: "https://kalshi.com/markets/kxhighny",
     });
-  } catch (e) {
-    console.error(e);
-    // still return CORS headers with errors
-    return res.status(502).json({ error: "Upstream error", details: String(e) });
+  } catch (err) {
+    console.error(err);
+    return res.status(502).json({ error: "Upstream error", details: String(err) });
   }
 }
 
-function toKalshiTickers(dateISO) {
+function toKalshiEventTicker(dateISO) {
   const [Y, M, D] = dateISO.split("-");
   const yy = Y.slice(-2);
   const mon = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][Number(M)-1];
-  // Try both variants
-  return [
-    `KXHIGHNY-${yy}${mon}${D}`,
-    `HIGHNY-${yy}${mon}${D}`,
-  ];
+  return `KXHIGHNY-${yy}${mon}${D}`;
 }
 
-function pickWinner(markets){
+function pickWinner(markets) {
   if (!Array.isArray(markets)) return null;
-  return markets.find(m => m.result === "yes")
-      || markets.find(m => m.settlement_value != null)
-      || markets.find(m => (m.status||"").toLowerCase()==="finalized" || (m.status||"").toLowerCase()==="settled")
-      || null;
+  return (
+    markets.find(m => m.result === "yes") ||
+    markets.find(m => m.settlement_value != null) ||
+    markets.find(m => (m.status || "").toLowerCase() === "finalized" || (m.status || "").toLowerCase() === "settled")
+  ) || null;
 }
 
-function winnerToInfo(w){
+function winnerToInfo(w) {
   if (!w) return null;
   const label = w.subtitle || w.title || w.ticker || "Settled";
   const exactTemp =
     w.expiration_value != null ? Number(w.expiration_value) :
-    w.settlement_value != null ? Number(w.settlement_value) : null;
+    w.settlement_value != null ? Number(w.settlement_value) :
+    null;
   return { label, exactTemp };
-}
-
-// Some /events/ responses carry the event-level settlement_value.
-function valueFromEvent(ev){
-  if (!ev) return null;
-  if (ev.settlement_value != null) {
-    return { label: `${ev.settlement_value} °F`, exactTemp: Number(ev.settlement_value) };
-  }
-  return null;
 }
