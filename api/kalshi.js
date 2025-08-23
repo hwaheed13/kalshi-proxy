@@ -1,23 +1,20 @@
-// /api/kalshi
+// /api/kalshi.js  (Node runtime)
 export default async function handler(req, res) {
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
+  setCORS(res);
+  if (req.method === "OPTIONS") return res.status(204).end(); // preflight ok
 
   const { date } = req.query || {};
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return res.status(400).json({ error: "Missing or bad ?date=YYYY-MM-DD" });
+    return json(res, 400, { error: "Missing or bad ?date=YYYY-MM-DD" });
   }
 
   const base = "https://api.elections.kalshi.com/trade-api/v2";
-  const tickers = makeTickers(date); // tries both HIGHNY and KXHIGHNY
+  const tickers = makeTickers(date); // tries HIGHNY-… then KXHIGHNY-…
 
   try {
     let info = null;
 
-    // 1) events?with_nested_markets=true
+    // 1) /events/:ticker?with_nested_markets=true
     for (const t of tickers) {
       const r0 = await fetch(`${base}/events/${encodeURIComponent(t)}?with_nested_markets=true`, {
         headers: { Accept: "application/json" },
@@ -29,7 +26,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) markets?event_ticker=
+    // 2) /markets?event_ticker=…
     if (!info) {
       for (const t of tickers) {
         const r1 = await fetch(`${base}/markets?event_ticker=${encodeURIComponent(t)}`, {
@@ -60,15 +57,32 @@ export default async function handler(req, res) {
 
     res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=60");
 
-    if (!info) return res.status(204).end(); // nothing settled for that date
-    return res.status(200).json({
+    if (!info) return empty(res, 204); // no content yet (still CORS headers)
+    return json(res, 200, {
       ...info,
       url: "https://kalshi.com/markets/kxhighny",
     });
   } catch (err) {
     console.error(err);
-    return res.status(502).json({ error: "Upstream error", details: String(err) });
+    return json(res, 502, { error: "Upstream error", details: String(err) });
   }
+}
+
+function setCORS(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+function json(res, status, obj) {
+  setCORS(res);
+  res.status(status).setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(obj));
+}
+
+function empty(res, status = 204) {
+  setCORS(res);
+  res.status(status).end();
 }
 
 function makeTickers(dateISO) {
@@ -76,8 +90,8 @@ function makeTickers(dateISO) {
   const yy = Y.slice(-2);
   const mon = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][Number(M)-1];
   return [
-    `HIGHNY-${yy}${mon}${D}`,   // variant you saw in the API
-    `KXHIGHNY-${yy}${mon}${D}`, // previous variant we were using
+    `HIGHNY-${yy}${mon}${D}`,   // you observed this live
+    `KXHIGHNY-${yy}${mon}${D}`, // our older variant
   ];
 }
 
