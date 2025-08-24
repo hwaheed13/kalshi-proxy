@@ -29,7 +29,11 @@ export default async function handler(req, res) {
     const markets = Array.isArray(j?.markets) ? j.markets : [];
 
     // We only want *live* (open) markets to infer the leader
-    const open = markets.filter(m => String(m.status || "").toLowerCase() === "open");
+    const openish = markets.filter(m => {
+  const s = String(m.status || "").toLowerCase();
+  return s === "open" || s === "trading" || s === "active";
+});
+const open = openish.length ? openish : markets;
     if (!open.length) return res.status(204).end(); // nothing live to infer
 
     // Pick the market with highest implied YES probability
