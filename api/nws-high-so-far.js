@@ -1,58 +1,98 @@
 // api/nws-high-so-far.js
 export default async function handler(req, res) {
-  // CORS — same style as your other kalshi-proxy routes
   const origin = req.headers.origin || "https://waheedweather.dewdropventures.com";
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Cache-Control", "no-store");
+  // Strong anti-cache for edges
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("CDN-Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  const station = (req.query.station || "KNYC").toUpperCase(); // Central Park
-  try {
-    // Build NYC-local start/end for "today" and convert to UTC ISO
-    const tz = "America/New_York";
-    const now = new Date();
+  const station = (req.query.station || "KNYC").toUpperCase();
+  const tz = "America/New_York";
+
+  // Helper: NYC local date string
+  const toNYDate = (d) => {
     const parts = new Intl.DateTimeFormat("en-CA", {
       timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
-    }).formatToParts(now);
+    }).formatToParts(d);
     const get = t => parts.find(p => p.type === t)?.value;
-    const yyyy = +get("year"), mm = +get("month"), dd = +get("day");
-    const toUtcIso = (y,m,d,H,M,S) => new Date(Date.UTC(y, m-1, d, H, M, S)).toISOString();
-    const startISO = toUtcIso(yyyy, mm, dd, 0, 0, 0);
-    const endISO   = toUtcIso(yyyy, mm, dd, 23, 59, 59);
+    return `${get("year")}-${get("month")}-${get("day")}`;
+  };
 
-    const url = `https://api.weather.gov/stations/${encodeURIComponent(station)}/observations` +
-                `?start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}&limit=500`;
+  // Helper: treat only near top-of-hour obs as “official-ish” hourly
+  const isTopOfHourish = (iso) => {
+    const d = new Date(iso);
+    // convert to NY clock for minute check
+    const ny = new Date(d.toLocaleString("en-US", { timeZone: tz }));
+    const m = ny.getMinutes();
+    // NWS hourly often lands ~:51; accept a small window around the hour
+    return (m >= 45 && m <= 59) || (m >= 0 && m <= 6);
+  };
 
+  try {
+    // Newest→oldest; 200 obs ~ 2–3 days
+    const url = `https://api.weather.gov/stations/${encodeURIComponent(station)}/observations?limit=200`;
     const r = await fetch(url, {
       headers: {
         Accept: "application/geo+json, application/json",
         "User-Agent": "waheedweather-dash (contact: you@example.com)"
-        // If you want to send your token server-side later, add:
-        // , token: process.env.NWS_API_KEY
+        // token: process.env.NWS_API_KEY // optional
       }
     });
-    if (!r.ok) return res.status(502).json({ error: "NWS upstream error" });
+    if (!r.ok) return res.status(502).json({ error: "NWS upstream error", status: r.status });
 
     const j = await r.json();
     const feats = Array.isArray(j?.features) ? j.features : [];
-    let bestF = null, bestTs = null;
+    if (!feats.length) return res.status(204).end();
+
+    const todayNY = toNYDate(new Date());
+
+    let bestF = null, bestTs = null, countToday = 0, countTop = 0;
+
     for (const f of feats) {
-      const c = f?.properties?.temperature?.value; // °C
       const ts = f?.properties?.timestamp;
+      if (!ts) continue;
+
+      // keep only today's NYC obs
+      if (toNYDate(new Date(ts)) !== todayNY) continue;
+      countToday++;
+
+      // keep only near top-of-hour obs (filters out specials)
+      if (!isTopOfHourish(ts)) continue;
+      countTop++;
+
+      const c = f?.properties?.temperature?.value; // °C
       if (c == null || !Number.isFinite(c)) continue;
+
       const F = c * 9/5 + 32;
       if (bestF == null || F > bestF) { bestF = F; bestTs = ts; }
     }
+
+    if (bestF == null) {
+      // fallback: if no top-of-hour obs yet today, allow any obs from today
+      for (const f of feats) {
+        const ts = f?.properties?.timestamp;
+        if (!ts) continue;
+        if (toNYDate(new Date(ts)) !== todayNY) continue;
+        const c = f?.properties?.temperature?.value;
+        if (c == null || !Number.isFinite(c)) continue;
+        const F = c * 9/5 + 32;
+        if (bestF == null || F > bestF) { bestF = F; bestTs = ts; }
+      }
+    }
+
     if (bestF == null) return res.status(204).end();
 
     res.status(200).json({
       station,
       highF: Math.round(bestF * 10) / 10,
-      atISO: bestTs,
-      count: feats.length
+      atISO: bestTs,          // ISO of the hourly obs that set the high
+      countToday,
+      countTop                 // how many top-of-hour obs we considered
     });
   } catch (e) {
     console.error(e);
