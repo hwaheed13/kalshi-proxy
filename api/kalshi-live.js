@@ -72,43 +72,38 @@ function toKalshiEventTicker(dateISO) {
 }
 
 /**
- * Try to infer YES probability from common fields.
- * Falls back to mid(bid, ask) if present. Returns 0..1 or null.
+ * Stable implied YES probability for LIVE view.
+ * Uses best bid/ask (or order_book bids/asks) — NEVER last_price.
+ * Returns 0..1 or null.
  */
 function impliedYesProb(m) {
-  // Common price-ish fields we’ve seen in Kalshi payloads.
-  const candidates = [
-    m.last_price,
-    m.last_trade_price,
-    m.yes_price,
-    m.last_trade,     // sometimes present
-    m.close_price
-  ].map(n => numOrNull(n)).filter(n => n != null);
+  // Pull top-of-book from explicit fields or from order_book
+  const bidRaw = numOrNull(m.yes_bid)
+    ?? pathNum(m, ["order_book", "yes", "best_bid", "price"])
+    ?? pathNum(m, ["order_book", "bids", 0, "price"]);
 
-  let p = candidates.length ? candidates[0] : null;
+  const askRaw = numOrNull(m.yes_ask)
+    ?? pathNum(m, ["order_book", "yes", "best_ask", "price"])
+    ?? pathNum(m, ["order_book", "asks", 0, "price"]);
 
-  // Attempt orderbook mid if available (field names are defensive guesses)
-  if (p == null && m.order_book) {
-    const bestBid = pathNum(m, ["order_book","yes","best_bid","price"]) ?? pathNum(m, ["order_book","bids",0,"price"]);
-    const bestAsk = pathNum(m, ["order_book","yes","best_ask","price"]) ?? pathNum(m, ["order_book","asks",0,"price"]);
-    if (bestBid != null && bestAsk != null) {
-      p = (bestBid + bestAsk) / 2;
-    } else if (bestBid != null) {
-      p = bestBid;
-    } else if (bestAsk != null) {
-      p = bestAsk;
-    }
-  }
+  // Normalize (Kalshi sometimes returns cents)
+  const norm = v => (v > 1 && v <= 100 ? v / 100 : v);
+  const b = bidRaw != null ? norm(bidRaw) : null;
+  const a = askRaw != null ? norm(askRaw) : null;
 
-  if (p == null) return null;
+  const in01 = v => v != null && Number.isFinite(v) && v >= 0 && v <= 1;
 
-  // Kalshi prices are typically in dollars 0..1 for NO/YES contracts.
-  // If your feed is in cents, normalize:
-  if (p > 1 && p <= 100) p = p / 100;
+  // Best case: both sides — use midpoint
+  if (in01(b) && in01(a) && a >= b) return (a + b) / 2;
 
-  if (p < 0 || p > 1) return null;
-  return p;
+  // One-sided: use what we have (still better than last trade)
+  if (in01(b) && a == null) return b;   // lower bound
+  if (in01(a) && b == null) return a;   // upper bound
+
+  // Otherwise: we don't have a reliable live signal
+  return null;
 }
+
 
 function numOrNull(x) {
   const n = Number(x);
