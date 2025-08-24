@@ -1,16 +1,13 @@
 // api/kalshi.js
 export default async function handler(req, res) {
-  // --- CORS: always set, and vary by origin
-  const origin = req.headers.origin || "*";          // or restrict to https://waheedweather.dewdropventures.com
-  res.setHeader("Access-Control-Allow-Origin", origin);
+  // CORS (lock to your site)
+  res.setHeader("Access-Control-Allow-Origin", "https://waheedweather.dewdropventures.com");
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  // --- IMPORTANT: kill caching to avoid 304 without CORS headers
+  // Avoid 304s that drop headers
   res.setHeader("Cache-Control", "no-store");
 
-  // Preflight
   if (req.method === "OPTIONS") return res.status(204).end();
 
   const { date } = req.query || {};
@@ -24,14 +21,27 @@ export default async function handler(req, res) {
   try {
     let info = null;
 
-    // 1) Event with nested markets
-    const r0 = await fetch(
+    // 1) Event with nested markets (KXHIGHNY-*)
+    let r0 = await fetch(
       `${base}/events/${encodeURIComponent(eventTicker)}?with_nested_markets=true`,
       { headers: { Accept: "application/json" } }
     );
     if (r0.ok) {
       const j0 = await r0.json();
       info = winnerToInfo(pickWinner(j0?.event?.markets));
+    }
+
+    // Fallback to legacy HIGHNY-* if needed
+    if (!info) {
+      const legacyTicker = eventTicker.replace(/^KXHIGHNY-/, "HIGHNY-");
+      r0 = await fetch(
+        `${base}/events/${encodeURIComponent(legacyTicker)}?with_nested_markets=true`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (r0.ok) {
+        const j0b = await r0.json();
+        info = winnerToInfo(pickWinner(j0b?.event?.markets));
+      }
     }
 
     // 2) Markets by event
@@ -46,10 +56,9 @@ export default async function handler(req, res) {
       }
     }
 
-    // 3) Series fallback (filter to this event)
+    // 3) Series fallback
     if (!info) {
-      const r2 = await fetch(
-        `${base}/markets?series_ticker=KXHIGHNY&status=settled`,
+      const r2 = await fetch(`${base}/markets?series_ticker=KXHIGHNY&status=settled`,
         { headers: { Accept: "application/json" } }
       );
       if (r2.ok) {
@@ -59,12 +68,9 @@ export default async function handler(req, res) {
       }
     }
 
-    if (!info) return res.status(204).end(); // no content yet
-    return res.status(200).json({
-      ...info,
-      eventTicker,
-      url: "https://kalshi.com/markets/kxhighny",
-    });
+    if (!info) return res.status(204).end();
+    return res.status(200).json({ ...info, eventTicker, url: "https://kalshi.com/markets/kxhighny" });
+
   } catch (err) {
     console.error(err);
     return res.status(502).json({ error: "Upstream error", details: String(err) });
