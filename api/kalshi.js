@@ -1,11 +1,21 @@
 // api/kalshi.js
+const ALLOW = new Set([
+  "https://dailydewpoint.com",
+  "http://localhost:3000",  // keep if you dev locally
+]);
+
 export default async function handler(req, res) {
-  // CORS (lock to your site)
-  res.setHeader("Access-Control-Allow-Origin", "https://waheedweather.dewdropventures.com");
+  const origin = req.headers.origin || "";
+  const allow = ALLOW.has(origin) ? origin : "https://dailydewpoint.com";
+
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", allow);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  // Avoid 304s that drop headers
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    req.headers["access-control-request-headers"] || "Content-Type, Authorization"
+  );
   res.setHeader("Cache-Control", "no-store");
 
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -21,7 +31,7 @@ export default async function handler(req, res) {
   try {
     let info = null;
 
-    // 1) Event with nested markets (KXHIGHNY-*)
+    // 1) Event with nested markets
     let r0 = await fetch(
       `${base}/events/${encodeURIComponent(eventTicker)}?with_nested_markets=true`,
       { headers: { Accept: "application/json" } }
@@ -31,7 +41,7 @@ export default async function handler(req, res) {
       info = winnerToInfo(pickWinner(j0?.event?.markets));
     }
 
-    // Fallback to legacy HIGHNY-* if needed
+    // Fallback to legacy
     if (!info) {
       const legacyTicker = eventTicker.replace(/^KXHIGHNY-/, "HIGHNY-");
       r0 = await fetch(
@@ -58,7 +68,8 @@ export default async function handler(req, res) {
 
     // 3) Series fallback
     if (!info) {
-      const r2 = await fetch(`${base}/markets?series_ticker=KXHIGHNY&status=settled`,
+      const r2 = await fetch(
+        `${base}/markets?series_ticker=KXHIGHNY&status=settled`,
         { headers: { Accept: "application/json" } }
       );
       if (r2.ok) {
@@ -70,35 +81,8 @@ export default async function handler(req, res) {
 
     if (!info) return res.status(204).end();
     return res.status(200).json({ ...info, eventTicker, url: "https://kalshi.com/markets/kxhighny" });
-
   } catch (err) {
     console.error(err);
     return res.status(502).json({ error: "Upstream error", details: String(err) });
   }
-}
-
-function toKalshiEventTicker(dateISO) {
-  const [Y, M, D] = dateISO.split("-");
-  const yy = Y.slice(-2);
-  const mon = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][Number(M)-1];
-  return `KXHIGHNY-${yy}${mon}${D}`;
-}
-
-function pickWinner(markets) {
-  if (!Array.isArray(markets)) return null;
-  return (
-    markets.find(m => m.result === "yes") ||
-    markets.find(m => m.settlement_value != null) ||
-    markets.find(m => (m.status || "").toLowerCase() === "finalized" || (m.status || "").toLowerCase() === "settled")
-  ) || null;
-}
-
-function winnerToInfo(w) {
-  if (!w) return null;
-  const label = w.subtitle || w.title || w.ticker || "Settled";
-  const exactTemp =
-    w.expiration_value != null ? Number(w.expiration_value) :
-    w.settlement_value != null ? Number(w.settlement_value) :
-    null;
-  return { label, exactTemp };
 }
